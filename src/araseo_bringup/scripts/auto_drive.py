@@ -25,6 +25,10 @@ DIR_L, DIR_R = 1, -1
 
 ROAD_S_MAX = 100
 ROAD_V_MAX = 90
+# 옵션 1: V 우선 검출용 보조 임계값
+ROAD_DARK_V = 90       # 이 값 이하면 색 무관 도로로 인식
+ROAD_GRAY_S = 60       # 채도 낮으면 (회색조)
+ROAD_GRAY_V = 130      # 약간 밝아도 도로로 인식
 
 STEER_Y_TOP = 350
 STEER_Y_BOT = 450
@@ -85,8 +89,10 @@ def drive_loop():
 
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-            # 도로 마스크 (검은 영역만 도로, 나머지 전부 경계)
-            road = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, ROAD_S_MAX, ROAD_V_MAX]))
+            # 도로 마스크 (V 우선): 어두우면 색 무관 도로 OR 회색조면 도로
+            road_dark = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, ROAD_DARK_V]))
+            road_gray = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, ROAD_GRAY_S, ROAD_GRAY_V]))
+            road = cv2.bitwise_or(road_dark, road_gray)
             # 노란선/흰선 등 밝은 영역은 도로에서 제외
             boundary = cv2.bitwise_not(road)
 
@@ -187,6 +193,28 @@ def drive_loop():
             status = "DRIVE" if speed > 0 else "STOP"
             cv2.putText(disp, f'{status} {mode} spd={speed} turn={turn} w={road_width:.0f} road={road_pct:.0f}%',
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            # ── 디버그: 우측 하단 영역 H/S/V 분석 ──
+            BR_X1, BR_Y1, BR_X2, BR_Y2 = 480, 320, 640, 480
+            br_hsv = hsv[BR_Y1:BR_Y2, BR_X1:BR_X2]
+            br_h, br_s, br_v = cv2.split(br_hsv)
+            br_road = road[BR_Y1:BR_Y2, BR_X1:BR_X2]
+            br_total = br_road.size
+            br_road_cnt = np.count_nonzero(br_road)
+            br_road_pct = 100.0 * br_road_cnt / br_total if br_total > 0 else 0
+            # 임계값 초과 픽셀 비율
+            s_over = 100.0 * np.count_nonzero(br_s > ROAD_S_MAX) / br_total
+            v_over = 100.0 * np.count_nonzero(br_v > ROAD_V_MAX) / br_total
+            # ROI 표시 (시안색)
+            cv2.rectangle(disp, (BR_X1, BR_Y1), (BR_X2-1, BR_Y2-1), (255, 255, 0), 2)
+            # 텍스트 (배경 어둡게)
+            cv2.rectangle(disp, (5, 35), (470, 95), (0, 0, 0), -1)
+            cv2.putText(disp, f'BR H avg/max: {br_h.mean():.0f}/{br_h.max():.0f}',
+                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
+            cv2.putText(disp, f'BR S avg/max: {br_s.mean():.0f}/{br_s.max():.0f}  (limit<={ROAD_S_MAX}, over={s_over:.0f}%)',
+                        (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
+            cv2.putText(disp, f'BR V avg/max: {br_v.mean():.0f}/{br_v.max():.0f}  (limit<={ROAD_V_MAX}, over={v_over:.0f}%)  road={br_road_pct:.0f}%',
+                        (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
 
             h2 = IMG_H // 2
             w2 = IMG_W // 2

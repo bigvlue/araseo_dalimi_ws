@@ -1,0 +1,59 @@
+lane_follower:
+  ros__parameters:
+    robot_id: 0
+
+    # 카메라 해상도
+    image_width: 640
+    image_height: 480
+
+    # BEV 변환 포인트 (픽셀)
+    bev_src_pts: [100, 480, 540, 480, 220, 300, 420, 300]
+    bev_dst_pts: [100, 480, 540, 480, 100,   0, 540,   0]
+
+    # HSV 황색 중앙선 범위
+    yellow_h_low:  15
+    yellow_h_high: 35
+    yellow_s_low:  80
+    yellow_s_high: 255
+    yellow_v_low:  80
+    yellow_v_high: 255
+
+    # HSV 백색 차로선 범위
+    white_s_high: 60
+    white_v_low:  180
+
+    # 슬라이딩 윈도우
+    n_windows: 9
+    margin_px: 60
+    min_pixels: 30
+
+    # Pure Pursuit
+    lookahead_straight_m: 0.30
+    lookahead_curve_m:    0.15
+    base_speed_mps:       0.15
+    max_steering_rad:     0.524   # 30도
+    wheelbase_m:          0.110   # 핑키 프로 110mm
+
+    # 정지선 감지
+    stop_line_roi_y: 420          # 정지선 감지 ROI y 시작
+    stop_line_threshold: 80       # 백색 픽셀 수 임계값
+
+    # 교차로 감지
+    intersection_yellow_min_px: 300
+    intersection_aspect_min: 0.35
+
+    # 발행 주기
+    publish_hz: 20.0
+
+    # 도로 ROI 다각형 — 원본 이미지 좌표 (x0,y0, x1,y1, ... 플랫 리스트)
+    # 이 다각형 안쪽만 BEV 변환에 사용되며, 바깥은 블랙아웃됨
+    # 캘리브레이션 후 bev_calibrator.py 가 자동으로 덮어씀
+    # 기본값: 이미지 하단 절반 (캘리브레이션 전 폴백용)
+    roi_pts: [0, 480, 640, 480, 640, 200, 0, 200]
+
+    # ── IR 센서 (TCRT5000 × 3) ─────────────────────────────────
+    # 토픽: /robot_{id}/ir_sensors  (std_msgs/Int16MultiArray)
+    # 값:   [left, center, right]  0=검정(도로) / 1=흰색(라인)
+    ir_stop_min_sensors:  2      # 정지선 판정에 필요한 최소 흰색 감지 센서 수
+    ir_lane_assist:       true   # 카메라 차선 전실 시 IR 조향 보조 사용 여부
+    ir_lane_error_gain:   0.4    # IR 보조 조향 게인 (lateral_error 환산 배율)

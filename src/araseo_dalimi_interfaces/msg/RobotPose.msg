@@ -1,0 +1,10 @@
+uint32 stamp_ms
+uint8 robot_id
+int16 x_mm
+int16 y_mm
+int16 theta_mrad
+uint8 confidence_pct
+uint8 source
+uint8 SOURCE_GPS_CAMERA=0
+uint8 SOURCE_LIDAR=1
+uint8 SOURCE_IMU_ODOM=2

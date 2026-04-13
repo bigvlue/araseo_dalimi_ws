@@ -1,0 +1,41 @@
+[Unit]
+Description=ARASEO-DALIMI Robot Auto-Start
+After=network.target
+Wants=network.target
+
+[Service]
+Type=forking
+User=pi
+Environment="HOME=/home/pi"
+Environment="ROBOT_ID=14"
+Environment="ROS_DOMAIN_ID=204"
+Environment="ROS_DISTRO=jazzy"
+
+# 워크스페이스 경로 — 실제 경로로 수정 필요
+Environment="WS_PATH=/home/pi/araseo_dalimi_ws"
+
+ExecStartPre=/bin/sleep 3
+ExecStart=/bin/bash -c '\
+    tmux kill-session -t araseo 2>/dev/null; \
+    tmux new-session -d -s araseo -n launch && \
+    tmux send-keys -t araseo:launch \
+        "source /opt/ros/${ROS_DISTRO}/setup.bash && \
+         source ${WS_PATH}/install/setup.bash && \
+         export ROS_DOMAIN_ID=${ROS_DOMAIN_ID} && \
+         ros2 launch araseo_bringup robot.launch.py robot_id=${ROBOT_ID}" \
+        Enter'
+
+ExecStop=/bin/bash -c '\
+    source /opt/ros/${ROS_DISTRO}/setup.bash 2>/dev/null; \
+    export ROS_DOMAIN_ID=${ROS_DOMAIN_ID}; \
+    ros2 topic pub --once /robot_${ROBOT_ID}/cmd_vel_safe \
+        geometry_msgs/msg/Twist \
+        "{linear: {x: 0.0}, angular: {z: 0.0}}" 2>/dev/null; \
+    tmux kill-session -t araseo 2>/dev/null'
+
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

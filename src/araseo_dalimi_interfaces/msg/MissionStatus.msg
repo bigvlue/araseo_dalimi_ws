@@ -1,0 +1,11 @@
+uint32 stamp_ms
+uint8 robot_id
+uint8 mission_state
+uint8 current_goal_idx
+uint8 total_goals
+float32 progress_percent
+uint8 IDLE=0
+uint8 RUNNING=1
+uint8 PAUSED=2
+uint8 COMPLETED=3
+uint8 FAILED=4

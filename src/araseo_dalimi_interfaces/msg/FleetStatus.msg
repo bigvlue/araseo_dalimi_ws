@@ -1,0 +1,10 @@
+uint32 stamp_ms
+uint8[] robot_ids
+int16[] x_mm
+int16[] y_mm
+int16[] theta_mrad
+uint8[] states
+uint8 STATE_IDLE=0
+uint8 STATE_RUNNING=1
+uint8 STATE_STOP=2
+uint8 STATE_ERROR=3

@@ -1,0 +1,35 @@
+traffic_law_manager:
+  ros__parameters:
+    robot_id: 0
+
+    # 속도 배율
+    speed_scale_normal:       1.0
+    speed_scale_slowdown:     0.5
+    speed_scale_intersection: 0.6
+    speed_scale_limit:        0.7
+
+    # 일시정지 시간 (초)
+    stop_hold_sec: 2.0
+
+    # 교차로 우측 우선 판단 거리 (mm)
+    yield_distance_mm: 500
+
+    # 황색 중앙선 침범 경고 임계값 (정규화 -1~1)
+    center_line_warn_threshold: 0.65
+
+    # 전방 로봇 추종 거리 (mm)
+    follow_distance_mm: 400
+
+    # 충돌 회피 정지 거리 (mm)
+    collision_stop_mm: 200
+
+    # ── LiDAR (RPLiDAR C1) ────────────────────────────────────────
+    # 토픽: /scan  (sensor_msgs/LaserScan)
+    lidar_slowdown_mm:   400   # 이 거리 이내 장애물 → 감속
+    lidar_stop_mm:       200   # 이 거리 이내 장애물 → COLLISION_AVOID
+    lidar_fov_deg:        90   # 전방 감지 각도 범위 (±45°)
+    lidar_max_range_mm:  800   # 유효 최대 거리 (맵 외부 차단)
+
+    # ── 초음파 (US-016) ───────────────────────────────────────────
+    # 토픽: /robot_{id}/ultrasonic  (sensor_msgs/Range)
+    ultrasonic_stop_mm:  150   # 이 거리 이내 → COLLISION_AVOID (failsafe)

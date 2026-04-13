@@ -1,0 +1,16 @@
+uint8 robot_id
+float32 goal_x_m
+float32 goal_y_m
+float32 goal_theta_rad
+float32 arrival_tolerance_m
+bool obey_traffic_law
+---
+bool success
+float32 total_distance_m
+float32 elapsed_time_sec
+string failure_reason
+---
+float32 distance_remaining_m
+float32 estimated_time_sec
+uint8 current_driving_mode
+araseo_dalimi_interfaces/TrafficSign last_sign

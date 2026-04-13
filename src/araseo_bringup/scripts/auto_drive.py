@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""
+검은 도로 기반 자율주행 + 웹 모니터링
+http://<robot_ip>:8089 접속
+"""
+import sys, time, threading, signal
+sys.path.insert(0, '/home/pinky/pinkylib/sensor/pinkylib')
+
+import cv2
+import numpy as np
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from camera import Camera
+from dynamixel_sdk import PortHandler, PacketHandler
+
+# ── 설정 ──
+IMG_W, IMG_H = 640, 480
+STREAM_PORT = 8089
+FPS = 15
+
+BASE_SPEED = 30
+MAX_TURN = 35
+WHEEL_L, WHEEL_R = 1, 2
+ADDR_GOAL_VEL = 104
+DIR_L, DIR_R = 1, -1
+
+ROAD_S_MAX = 100
+ROAD_V_MAX = 90
+
+STEER_Y_TOP = 350
+STEER_Y_BOT = 450
+LOOKAHEAD_Y = 300
+
+AWB_G = 0.89
+YELLOW_LOW = np.array([15, 80, 80])
+YELLOW_HIGH = np.array([35, 255, 255])
+
+# ── 전역 ──
+latest_jpeg = None
+lock = threading.Lock()
+running = True
+
+
+def signal_handler(sig, frame):
+    global running
+    running = False
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+def drive_loop():
+    global latest_jpeg, running
+
+    cam = Camera()
+    cam.start(width=IMG_W, height=IMG_H)
+    time.sleep(1)
+
+    port = PortHandler('/dev/ttyAMA4')
+    port.openPort()
+    port.setBaudRate(1000000)
+    ph = PacketHandler(2.0)
+    for mid in [WHEEL_L, WHEEL_R]:
+        ph.write1ByteTxRx(port, mid, 64, 1)
+
+    def set_motor(vx, vz):
+        left = int((vx + vz) * DIR_L)
+        right = int((vx - vz) * DIR_R)
+        left = max(-80, min(80, left))
+        right = max(-80, min(80, right))
+        ph.write4ByteTxRx(port, WHEEL_L, ADDR_GOAL_VEL, left & 0xFFFFFFFF)
+        ph.write4ByteTxRx(port, WHEEL_R, ADDR_GOAL_VEL, right & 0xFFFFFFFF)
+
+    def stop_motor():
+        ph.write4ByteTxRx(port, WHEEL_L, ADDR_GOAL_VEL, 0)
+        ph.write4ByteTxRx(port, WHEEL_R, ADDR_GOAL_VEL, 0)
+
+    print("Autonomous driving started")
+    frame_count = 0
+
+    try:
+        while running:
+            frame = cam.get_frame()
+            r, g, b = cv2.split(frame)
+            g = np.clip(g.astype(np.float32) * AWB_G, 0, 255).astype(np.uint8)
+            frame = cv2.merge([r, g, b])
+
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+            # 도로 마스크 (검은 영역만 도로, 나머지 전부 경계)
+            road = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, ROAD_S_MAX, ROAD_V_MAX]))
+            # 노란선/흰선 등 밝은 영역은 도로에서 제외
+            boundary = cv2.bitwise_not(road)
+
+            # 조향 ROI에서 가장 큰 연속 검은 구간(=도로) 찾기
+            def find_road_center(roi_mask):
+                """각 행에서 가장 넓은 연속 검은 구간을 찾아 중앙 반환"""
+                h, w = roi_mask.shape
+                best_cx_sum = 0.0
+                best_width_sum = 0.0
+                count = 0
+                for y in range(0, h, 3):  # 3행 간격 샘플링
+                    row = roi_mask[y, :]
+                    # 연속 구간 찾기
+                    runs = []
+                    start = -1
+                    for x in range(w):
+                        if row[x] > 0 and start < 0:
+                            start = x
+                        elif row[x] == 0 and start >= 0:
+                            runs.append((start, x - 1))
+                            start = -1
+                    if start >= 0:
+                        runs.append((start, w - 1))
+                    if runs:
+                        # 가장 넓은 구간
+                        best = max(runs, key=lambda r: r[1] - r[0])
+                        cx = (best[0] + best[1]) / 2.0
+                        bw = best[1] - best[0]
+                        best_cx_sum += cx
+                        best_width_sum += bw
+                        count += 1
+                if count > 0:
+                    return best_cx_sum / count, best_width_sum / count
+                return w / 2.0, 0.0
+
+            steer_roi = road[STEER_Y_TOP:STEER_Y_BOT, :]
+            road_center, road_width = find_road_center(steer_roi)
+
+            # 전방 주시점
+            look_roi = road[LOOKAHEAD_Y-20:LOOKAHEAD_Y+20, :]
+            look_center, _ = find_road_center(look_roi)
+
+            # 조향 계산
+            img_center = IMG_W / 2
+            # 가까운 곳(70%) + 먼 곳(30%) 가중 평균
+            raw_target = road_center * 0.7 + look_center * 0.3
+
+            # 커브 보정: 좌커브 70:30(우측 편향), 우커브 30:70(좌측 편향)
+            curve_dir = look_center - road_center  # 양수=우커브, 음수=좌커브
+            mode = "STRAIGHT"
+            if abs(curve_dir) > 15:
+                if curve_dir < 0:
+                    # 좌커브: 70:30 → 우측으로 20% 편향
+                    target = raw_target + road_width * 0.20
+                    mode = "CURVE-L"
+                else:
+                    # 우커브: 30:70 → 좌측으로 20% 편향
+                    target = raw_target - road_width * 0.20
+                    mode = "CURVE-R"
+            else:
+                target = raw_target
+
+            error = (target - img_center) / (IMG_W / 2)  # -1 ~ +1
+
+            # 도로 폭이 좁으면 (벽 가까이) 속도 줄이기
+            speed = BASE_SPEED
+            if road_width < 100:
+                speed = 0  # 도로를 거의 못 찾으면 정지
+            elif road_width < 200:
+                speed = int(BASE_SPEED * 0.5)
+
+            turn = int(error * MAX_TURN)
+
+            set_motor(speed, turn)
+
+            # 시각화 — 검은 도로만 원본, 나머지 전부 마젠타
+            disp = frame.copy()
+            # 노란 중앙선 별도 감지
+            yellow = cv2.inRange(hsv, YELLOW_LOW, YELLOW_HIGH)
+            white_boundary = cv2.bitwise_and(boundary, cv2.bitwise_not(yellow))
+            disp[white_boundary > 0] = [255, 0, 255]
+            disp[yellow > 0] = [0, 255, 255]
+
+            # 조향 ROI 표시
+            cv2.rectangle(disp, (0, STEER_Y_TOP), (IMG_W, STEER_Y_BOT), (0, 255, 0), 1)
+            # 도로 중앙 표시
+            cx = int(target)
+            cv2.line(disp, (cx, STEER_Y_TOP), (cx, STEER_Y_BOT), (0, 255, 0), 2)
+            cv2.line(disp, (IMG_W//2, STEER_Y_TOP), (IMG_W//2, STEER_Y_BOT), (255, 255, 0), 1)
+            # 전방 주시점
+            cv2.circle(disp, (int(look_center), LOOKAHEAD_Y), 8, (255, 0, 0), 2)
+
+            # 상태 텍스트
+            roi_total = (STEER_Y_BOT - STEER_Y_TOP) * IMG_W
+            roi_road = np.count_nonzero(steer_roi)
+            road_pct = 100.0 * roi_road / roi_total if roi_total > 0 else 0
+
+            status = "DRIVE" if speed > 0 else "STOP"
+            cv2.putText(disp, f'{status} {mode} spd={speed} turn={turn} w={road_width:.0f} road={road_pct:.0f}%',
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            h2 = IMG_H // 2
+            w2 = IMG_W // 2
+            small = cv2.resize(disp, (w2*2, h2*2))
+
+            _, jpeg = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            with lock:
+                latest_jpeg = jpeg.tobytes()
+
+            frame_count += 1
+            if frame_count % 30 == 0:
+                print(f"[{frame_count}] spd={speed} turn={turn} err={error:.2f} width={road_width:.0f}")
+
+            time.sleep(1.0 / FPS)
+
+    finally:
+        print("Stopping motors...")
+        stop_motor()
+        for mid in [WHEEL_L, WHEEL_R]:
+            ph.write1ByteTxRx(port, mid, 64, 0)
+        port.closePort()
+        cam.close()
+        print("Stopped.")
+
+
+class MJPEGHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'''<html><head><title>Auto Drive</title>
+<style>body{background:#111;margin:0;display:flex;flex-direction:column;align-items:center}
+img{max-width:100%;height:auto}
+button{margin:10px;padding:15px 30px;font-size:20px;background:red;color:white;border:none;border-radius:10px;cursor:pointer}
+</style></head><body>
+<img src="/stream">
+<button onclick="fetch('/stop')">EMERGENCY STOP</button>
+</body></html>''')
+        elif self.path == '/stream':
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            while True:
+                with lock:
+                    jpeg = latest_jpeg
+                if jpeg is None:
+                    time.sleep(0.05)
+                    continue
+                try:
+                    self.wfile.write(b'--frame\r\n')
+                    self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
+                    self.wfile.write(jpeg)
+                    self.wfile.write(b'\r\n')
+                    time.sleep(1.0 / FPS)
+                except BrokenPipeError:
+                    break
+        elif self.path == '/stop':
+            global running
+            running = False
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'stopped')
+        else:
+            self.send_error(404)
+
+    def log_message(self, format, *args):
+        pass
+
+
+if __name__ == '__main__':
+    t = threading.Thread(target=drive_loop, daemon=True)
+    t.start()
+    print(f'Monitor: http://0.0.0.0:{STREAM_PORT}')
+    HTTPServer(('0.0.0.0', STREAM_PORT), MJPEGHandler).serve_forever()

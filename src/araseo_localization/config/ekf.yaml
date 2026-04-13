@@ -1,0 +1,98 @@
+### ekf_filter_node 파라미터
+### robot_id는 런치 파일에서 네임스페이스로 주입됨
+
+ekf_filter_node:
+  ros__parameters:
+
+    # 좌표 프레임
+    world_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    map_frame: map
+
+    # 10Hz 업데이트
+    frequency: 10.0
+    sensor_timeout: 0.5
+    two_d_mode: true        # 미니 시티는 평면 환경
+    publish_tf: true
+    print_diagnostics: true
+
+    # ── 센서 0: Odometry (바퀴 인코더) ─────────────────────────
+    odom0: odom
+    # [x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az]
+    odom0_config: [true,  true,  false,
+                   false, false, true,
+                   true,  false, false,
+                   false, false, true,
+                   false, false, false]
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 5
+    odom0_nodelay: false
+    odom0_pose_rejection_threshold: 2.0
+    odom0_twist_rejection_threshold: 0.5
+
+    # ── 센서 1: IMU (BNO055) ────────────────────────────────────
+    imu0: imu/data
+    # [roll, pitch, yaw, vroll, vpitch, vyaw, ax, ay, az]
+    imu0_config: [false, false, true,
+                  false, false, true,
+                  false, false, true]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: true
+    imu0_queue_size: 10
+    imu0_nodelay: true
+    imu0_pose_rejection_threshold: 0.5
+    imu0_twist_rejection_threshold: 0.5
+    imu0_linear_acceleration_rejection_threshold: 0.5
+
+    # ── 센서 2: GPS 카메라 (절대 위치) ─────────────────────────
+    # RobotPose → Odometry 변환 노드가 /gps_pose_odom 으로 발행
+    odom1: gps_pose_odom
+    odom1_config: [true,  true,  false,
+                   false, false, true,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+    odom1_differential: false
+    odom1_relative: false
+    odom1_queue_size: 5
+    odom1_nodelay: false
+    odom1_pose_rejection_threshold: 0.8
+    odom1_twist_rejection_threshold: 999.0
+
+    # ── 프로세스 노이즈 (Q) ─────────────────────────────────────
+    # [x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az]
+    process_noise_covariance: [0.05, 0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.05, 0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.06, 0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.03,0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.03,0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.06, 0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.025,0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.025,0.0,0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.04,0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.01,0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.01,0.0, 0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.02,0.0, 0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.01,0.0, 0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01,0.0,
+                               0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.015]
+
+    # ── 초기 공분산 (P0) ─────────────────────────────────────────
+    initial_estimate_covariance: [1e-9, 0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  1e-9, 0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  1e-9, 0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  1e-9,0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 1e-9,0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 1e-9, 0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  1e-9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  1e-9,0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 1e-9,0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 1e-9,0.0, 0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 1e-9,0.0, 0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 1e-9,0.0, 0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 1e-9,0.0, 0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9,0.0,
+                                  0.0,  0.0,  0.0,  0.0, 0.0, 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-9]

@@ -1,0 +1,66 @@
+# 미니 시티 도로 토폴로지 그래프
+# 좌표계: 원점(0,0) = 맵 좌하단, x→우, y→상
+# 단위: mm, 맵 크기 1880×1410mm
+
+nodes:
+  # 외곽 트랙 노드
+  - id: "N_TL"   # Top-Left 곡선
+    x: 200
+    y: 1200
+  - id: "N_TR"   # Top-Right 곡선
+    x: 1680
+    y: 1200
+  - id: "N_BL"   # Bottom-Left 곡선
+    x: 200
+    y: 210
+  - id: "N_BR"   # Bottom-Right 곡선
+    x: 1680
+    y: 210
+  # 내부 교차로 노드
+  - id: "N_INT_NW"  # 교차로 북서
+    x: 620
+    y: 900
+  - id: "N_INT_NE"  # 교차로 북동
+    x: 1260
+    y: 900
+  - id: "N_INT_SW"  # 교차로 남서
+    x: 620
+    y: 510
+  - id: "N_INT_SE"  # 교차로 남동
+    x: 1260
+    y: 510
+  # 주차/목적지 노드
+  - id: "N_PARK_1"  # 좌상 주차구역
+    x: 450
+    y: 1050
+  - id: "N_PARK_2"  # 우상 주차구역
+    x: 1100
+    y: 1050
+  - id: "N_PARK_3"  # 좌하 주차구역
+    x: 450
+    y: 360
+  - id: "N_PARK_4"  # 우하 주차구역
+    x: 1100
+    y: 360
+
+edges:
+  # 외곽 트랙 (양방향)
+  - [N_TL,       N_TR,      1480]
+  - [N_TR,       N_BR,       990]
+  - [N_BR,       N_BL,      1480]
+  - [N_BL,       N_TL,       990]
+  # 내부 도로 (양방향)
+  - [N_INT_NW,   N_INT_NE,   640]
+  - [N_INT_SW,   N_INT_SE,   640]
+  - [N_INT_NW,   N_INT_SW,   390]
+  - [N_INT_NE,   N_INT_SE,   390]
+  # 외곽↔내부 진입로
+  - [N_TL,       N_INT_NW,   500]
+  - [N_TR,       N_INT_NE,   500]
+  - [N_BL,       N_INT_SW,   400]
+  - [N_BR,       N_INT_SE,   400]
+  # 주차구역 진입
+  - [N_INT_NW,   N_PARK_1,   250]
+  - [N_INT_NE,   N_PARK_2,   250]
+  - [N_INT_SW,   N_PARK_3,   250]
+  - [N_INT_SE,   N_PARK_4,   250]

@@ -1,0 +1,24 @@
+hud_overlay:
+  ros__parameters:
+    robot_id: 0
+
+    # 미니 시티 도로 물리 파라미터 (mm 단위)
+    road_width_mm: 280.0          # 전체 도로 폭 (황색선~흰색선)
+    lane_width_mm: 140.0          # 우측 차선 폭 (도로 절반)
+    camera_height_mm: 120.0       # 카메라 지상고
+
+    # HUD 레이어 기본 활성화 여부
+    show_drivable_area: true      # 녹색 주행 가능 영역
+    show_lane_markings: true      # 황색/흰색 차선선
+    show_path: true               # 주행 경로 화살표
+    show_waypoints: true          # 웨이포인트 마커
+    show_obstacles: true          # 장애물 박스
+    show_no_entry_zone: true      # 반대편 차선 금지 표시
+    show_traffic_state: true      # 교통법규 상태 표시
+
+    # 오버레이 투명도 (0.0~1.0)
+    alpha_drivable: 0.30
+    alpha_no_entry: 0.18
+
+    # 발행 주기
+    publish_hz: 20.0

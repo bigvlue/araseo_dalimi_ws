@@ -1,0 +1,12 @@
+uint32 stamp_ms
+uint8 robot_id
+uint8 sign_type
+uint8 confidence_pct
+uint8 distance_dm
+uint8 NONE=0
+uint8 STOP_LINE=1
+uint8 INTERSECTION=2
+uint8 SPEED_LIMIT=3
+uint8 NO_ENTRY=4
+uint8 PARKING_ZONE=5
+uint8 PEDESTRIAN=6

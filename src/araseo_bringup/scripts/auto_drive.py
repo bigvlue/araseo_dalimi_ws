@@ -4,12 +4,14 @@
 http://<robot_ip>:8089 접속
 """
 import sys, time, threading, signal
+from collections import deque
 sys.path.insert(0, '/home/pinky/pinkylib/sensor/pinkylib')
 
 import cv2
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from camera import Camera
+from battery import Battery
 from dynamixel_sdk import PortHandler, PacketHandler
 
 # ── 설정 ──
@@ -42,12 +44,31 @@ YELLOW_HIGH = np.array([35, 255, 255])
 BEV_SRC = np.float32([[  0, 480], [640, 480], [150, 300], [560, 300]])
 BEV_DST = np.float32([[100, 480], [540, 480], [100,   0], [540,   0]])
 BEV_M   = cv2.getPerspectiveTransform(BEV_SRC, BEV_DST)
+# BEV 유효 영역 마스크: 원본 사다리꼴 안쪽만 흰색, 밖은 검정
+# 꼭짓점 순서: BL, BR, TR, TL (시계방향, 자기교차 없음)
+_bev_src_poly = np.array([BEV_SRC[0], BEV_SRC[1], BEV_SRC[3], BEV_SRC[2]], dtype=np.int32)
+_bev_src_mask = np.zeros((480, 640), np.uint8)
+cv2.fillConvexPoly(_bev_src_mask, _bev_src_poly, 255)
+BEV_VALID = cv2.warpPerspective(_bev_src_mask, BEV_M, (640, 480))
+# 경계 가장자리 2px 살짝 안쪽으로 수축 (보간 노이즈 제거)
+BEV_VALID = cv2.erode(BEV_VALID, np.ones((3, 3), np.uint8), iterations=2)
 
 # ── 전역 ──
 latest_jpeg = None
 lock = threading.Lock()
 running = True
 driving_enabled = False    # 웹에서 START 누르기 전엔 정지 상태
+battery_v = 0.0            # 배터리 전압 (V), pinkylib I2C ADC 기반 (Pinky Pro = 2S LiPo)
+battery_pct = 0            # 배터리 잔량 (%)
+battery_state = '?'        # CHARGING / DISCHARGING / IDLE / ?
+battery_hist = deque(maxlen=16)   # (t, v) 샘플, 최대 16개 (약 32초)
+
+# 런타임 튜닝 가능 파라미터 (웹에서 조정)
+params = {
+    'weight_near':     0.70,   # 가까운 영역 가중치 (먼 영역 = 1 - 이값)
+    'curve_threshold': 15.0,   # 커브 판정 임계 (px, look-near 차이)
+    'curve_offset':    0.20,   # 커브 시 차로폭 대비 편향 비율
+}
 
 
 def signal_handler(sig, frame):
@@ -83,7 +104,45 @@ def drive_loop():
         ph.write4ByteTxRx(port, WHEEL_L, ADDR_GOAL_VEL, 0)
         ph.write4ByteTxRx(port, WHEEL_R, ADDR_GOAL_VEL, 0)
 
-    print("Autonomous driving started")
+    # Pinky 배터리 (I2C ADC, 2S LiPo: 만충 7.6V / 방전 6.8V)
+    try:
+        bat = Battery()
+    except Exception as e:
+        print(f"[경고] Battery 초기화 실패: {e}")
+        bat = None
+
+    def read_battery():
+        """pinkylib I2C ADC로 배터리 전압/잔량 읽기 + 충전 상태 추정"""
+        global battery_v, battery_pct, battery_state
+        if bat is None:
+            return
+        try:
+            v = bat.get_voltage()
+            if v is None or not (4.0 <= v <= 10.0):
+                return
+            battery_v = float(v)
+            # 2S LiPo 기준 (7.6V=100%, 6.8V=0%)
+            pct = (v - 6.8) / (7.6 - 6.8) * 100.0
+            battery_pct = int(max(0, min(100, pct)))
+            # 이력 추가 후 선형 기울기(V/s)로 충전/방전 판정
+            now = time.monotonic()
+            battery_hist.append((now, battery_v))
+            if len(battery_hist) >= 6:
+                xs = [t for t, _ in battery_hist]
+                ys = [vv for _, vv in battery_hist]
+                n = len(xs)
+                mx = sum(xs) / n; my = sum(ys) / n
+                num = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
+                den = sum((xs[i] - mx) ** 2 for i in range(n)) or 1e-9
+                slope = num / den   # V/s
+                if   slope >  0.003: battery_state = 'CHARGING'
+                elif slope < -0.002: battery_state = 'DISCHARGING'
+                else:                battery_state = 'IDLE'
+        except Exception:
+            pass
+
+    read_battery()
+    print(f"Autonomous driving started (battery: {battery_v:.2f}V, {battery_pct}%)")
     frame_count = 0
 
     try:
@@ -104,10 +163,11 @@ def drive_loop():
 
             # 조향 ROI에서 가장 큰 연속 검은 구간(=도로) 찾기
             def find_road_center(roi_mask):
-                """각 행에서 가장 넓은 연속 검은 구간을 찾아 중앙 반환"""
+                """각 행에서 가장 넓은 연속 검은 구간을 찾아 중앙/폭/좌우 반환
+                반환: (cx, width, left_x, right_x)
+                """
                 h, w = roi_mask.shape
-                best_cx_sum = 0.0
-                best_width_sum = 0.0
+                s_cx = s_w = s_l = s_r = 0.0
                 count = 0
                 for y in range(0, h, 3):  # 3행 간격 샘플링
                     row = roi_mask[y, :]
@@ -125,38 +185,39 @@ def drive_loop():
                     if runs:
                         # 가장 넓은 구간
                         best = max(runs, key=lambda r: r[1] - r[0])
-                        cx = (best[0] + best[1]) / 2.0
-                        bw = best[1] - best[0]
-                        best_cx_sum += cx
-                        best_width_sum += bw
+                        s_cx += (best[0] + best[1]) / 2.0
+                        s_w  += best[1] - best[0]
+                        s_l  += best[0]
+                        s_r  += best[1]
                         count += 1
                 if count > 0:
-                    return best_cx_sum / count, best_width_sum / count
-                return w / 2.0, 0.0
+                    return (s_cx / count, s_w / count, s_l / count, s_r / count)
+                return (w / 2.0, 0.0, 0.0, w - 1.0)
 
             steer_roi = road[STEER_Y_TOP:STEER_Y_BOT, :]
-            road_center, road_width = find_road_center(steer_roi)
+            road_center, road_width, road_left_x, road_right_x = find_road_center(steer_roi)
 
             # 전방 주시점
             look_roi = road[LOOKAHEAD_Y-20:LOOKAHEAD_Y+20, :]
-            look_center, _ = find_road_center(look_roi)
+            look_center, _, _, _ = find_road_center(look_roi)
 
-            # 조향 계산
+            # 조향 계산 (런타임 튜닝 파라미터 사용)
             img_center = IMG_W / 2
-            # 가까운 곳(70%) + 먼 곳(30%) 가중 평균
-            raw_target = road_center * 0.7 + look_center * 0.3
+            wn = params['weight_near']
+            ct = params['curve_threshold']
+            co = params['curve_offset']
+            # 가까운 곳(wn) + 먼 곳(1-wn) 가중 평균
+            raw_target = road_center * wn + look_center * (1.0 - wn)
 
-            # 커브 보정: 좌커브 70:30(우측 편향), 우커브 30:70(좌측 편향)
+            # 커브 보정: 좌커브=우측 편향, 우커브=좌측 편향
             curve_dir = look_center - road_center  # 양수=우커브, 음수=좌커브
             mode = "STRAIGHT"
-            if abs(curve_dir) > 15:
+            if abs(curve_dir) > ct:
                 if curve_dir < 0:
-                    # 좌커브: 70:30 → 우측으로 20% 편향
-                    target = raw_target + road_width * 0.20
+                    target = raw_target + road_width * co
                     mode = "CURVE-L"
                 else:
-                    # 우커브: 30:70 → 좌측으로 20% 편향
-                    target = raw_target - road_width * 0.20
+                    target = raw_target - road_width * co
                     mode = "CURVE-R"
             else:
                 target = raw_target
@@ -206,6 +267,33 @@ def drive_loop():
                 status = "DRIVE" if speed > 0 else "STOP"
             cv2.putText(disp, f'{status} {mode} spd={speed} turn={turn} w={road_width:.0f} road={road_pct:.0f}%',
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            # 배터리 표시 (우상단, 2S LiPo 기준) + 충전/방전 상태
+            if battery_state == 'CHARGING':
+                bat_color = (255, 200, 0)    # BGR 파랑/시안: 충전
+            elif battery_v >= 7.3:
+                bat_color = (0, 255, 0)
+            elif battery_v >= 7.0:
+                bat_color = (0, 255, 255)
+            else:
+                bat_color = (0, 0, 255)
+            if battery_v > 0:
+                tag = {'CHARGING': 'CHG', 'DISCHARGING': 'DIS',
+                       'IDLE': 'IDLE'}.get(battery_state, '?')
+                bat_text = f'BAT: {battery_v:.2f}V ({battery_pct}%) {tag}'
+            else:
+                bat_text = 'BAT: --'
+            cv2.rectangle(disp, (IMG_W - 305, 5), (IMG_W - 5, 35), (0, 0, 0), -1)
+            cv2.putText(disp, bat_text, (IMG_W - 300, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, bat_color, 2)
+            # 원본 기반 L/R/W (교차로 감지용)
+            cv2.putText(disp,
+                        f'L={road_left_x:.0f} R={road_right_x:.0f} W={road_width:.0f}',
+                        (10, IMG_H - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            # 좌/우 extent 세로선 표시 (조향 ROI 내)
+            cv2.line(disp, (int(road_left_x),  STEER_Y_TOP), (int(road_left_x),  STEER_Y_BOT),
+                     (255, 255, 0), 2)
+            cv2.line(disp, (int(road_right_x), STEER_Y_TOP), (int(road_right_x), STEER_Y_BOT),
+                     (0, 255, 255), 2)
 
             # ── 디버그: 우측 하단 영역 H/S/V 분석 ──
             BR_X1, BR_Y1, BR_X2, BR_Y2 = 480, 320, 640, 480
@@ -231,6 +319,35 @@ def drive_loop():
 
             # ── BEV 변환 (시각화 전용, 조향에는 미사용) ──
             bev = cv2.warpPerspective(disp, BEV_M, (IMG_W, IMG_H))
+
+            # ── BEV 도로 마스크 + 좌/우 extent 측정 (교차로 감지 단계 1) ──
+            bev_road = cv2.warpPerspective(road, BEV_M, (IMG_W, IMG_H))
+            # BEV 유효 영역만 유지 (사다리꼴 밖의 검은 테두리 제외)
+            bev_road = cv2.bitwise_and(bev_road, BEV_VALID)
+            BEV_ROI_TOP, BEV_ROI_BOT = 200, 440
+            bev_roi = bev_road[BEV_ROI_TOP:BEV_ROI_BOT, :]
+            left_xs = []
+            right_xs = []
+            for ry in range(0, bev_roi.shape[0], 4):
+                idx = np.flatnonzero(bev_roi[ry, :])
+                if idx.size > 5:
+                    left_xs.append(int(idx.min()))
+                    right_xs.append(int(idx.max()))
+            if left_xs:
+                bev_left  = int(np.mean(left_xs))
+                bev_right = int(np.mean(right_xs))
+                bev_w     = bev_right - bev_left
+            else:
+                bev_left = bev_right = bev_w = 0
+            # 시각화: BEV에 좌/우 extent 라인 + ROI 박스
+            cv2.rectangle(bev, (0, BEV_ROI_TOP), (IMG_W-1, BEV_ROI_BOT-1), (80, 80, 80), 1)
+            if bev_w > 0:
+                cv2.line(bev, (bev_left,  BEV_ROI_TOP), (bev_left,  BEV_ROI_BOT), (255, 255, 0), 2)
+                cv2.line(bev, (bev_right, BEV_ROI_TOP), (bev_right, BEV_ROI_BOT), (0, 255, 255), 2)
+            cv2.rectangle(bev, (5, 5), (290, 30), (0, 0, 0), -1)
+            cv2.putText(bev, f'L={bev_left} R={bev_right} W={bev_w}',
+                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+
             # BEV에 src 사다리꼴(원본에서 변환된 영역) 표시
             for i in range(4):
                 p1 = tuple(BEV_SRC[i].astype(int))
@@ -240,17 +357,17 @@ def drive_loop():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.putText(bev, 'BEV', (10, IMG_H - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            # 좌우 결합
+            # 좌우 결합 (원본 해상도 유지: 1280×480)
             combined = np.hstack([disp, bev])
-            small = cv2.resize(combined, (IMG_W, IMG_H // 2))
 
-            _, jpeg = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            _, jpeg = cv2.imencode('.jpg', combined, [cv2.IMWRITE_JPEG_QUALITY, 75])
             with lock:
                 latest_jpeg = jpeg.tobytes()
 
             frame_count += 1
             if frame_count % 30 == 0:
-                print(f"[{frame_count}] spd={speed} turn={turn} err={error:.2f} width={road_width:.0f}")
+                print(f"[{frame_count}] spd={speed} turn={turn} err={error:.2f} width={road_width:.0f} bat={battery_v:.1f}V")
+                read_battery()   # 약 2초마다 갱신
 
             time.sleep(1.0 / FPS)
 
@@ -273,28 +390,77 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write('''<html><head><meta charset="utf-8"><title>Auto Drive</title>
 <style>body{background:#111;margin:0;display:flex;flex-direction:column;align-items:center;color:#fff;font-family:sans-serif}
-img{max-width:100%;height:auto}
+img{width:98vw;max-width:1600px;height:auto;image-rendering:auto}
 .row{display:flex;gap:10px;margin:10px}
 button{padding:18px 36px;font-size:22px;color:#fff;border:none;border-radius:10px;cursor:pointer;font-weight:bold}
 .start{background:#2ecc40}
 .pause{background:#ff851b}
 .stop{background:#ff4136}
 #state{font-size:24px;margin:8px;font-weight:bold}
+.params{background:#222;padding:12px 20px;border-radius:8px;margin:10px;min-width:560px}
+.param{display:flex;align-items:center;gap:10px;margin:8px 0}
+.param label{flex:1;font-size:16px}
+.param input[type=range]{flex:2}
+.param .v{width:60px;text-align:right;font-family:monospace;font-size:16px;color:#ffe066}
 </style></head><body>
 <img src="/stream">
 <div id="state">State: loading...</div>
+<div id="battery" style="font-size:22px;margin:4px;font-weight:bold">BAT: --</div>
 <div class="row">
   <button class="start" onclick="cmd('start')">START</button>
   <button class="pause" onclick="cmd('pause')">PAUSE</button>
   <button class="stop" onclick="if(confirm('Stop program?'))cmd('stop')">EMERGENCY</button>
+</div>
+<div class="params">
+  <div class="param">
+    <label>weight_near (가까운 영역 가중치)</label>
+    <input id="p_weight_near" type="range" min="0" max="1" step="0.05"
+           oninput="setp('weight_near', this.value)">
+    <span class="v" id="v_weight_near">-</span>
+  </div>
+  <div class="param">
+    <label>curve_threshold (커브 판정 px)</label>
+    <input id="p_curve_threshold" type="range" min="0" max="50" step="1"
+           oninput="setp('curve_threshold', this.value)">
+    <span class="v" id="v_curve_threshold">-</span>
+  </div>
+  <div class="param">
+    <label>curve_offset (커브 편향 비율)</label>
+    <input id="p_curve_offset" type="range" min="0" max="0.5" step="0.01"
+           oninput="setp('curve_offset', this.value)">
+    <span class="v" id="v_curve_offset">-</span>
+  </div>
 </div>
 <script>
 function cmd(c){fetch('/'+c).then(r=>r.text()).then(refresh)}
 function refresh(){fetch('/state').then(r=>r.text()).then(t=>{
   document.getElementById('state').textContent='State: '+t;
   document.getElementById('state').style.color = (t==='DRIVING')?'#2ecc40':'#ff851b';
+})
+fetch('/battery').then(r=>r.text()).then(v=>{
+  const [vs, ps, st] = v.split(' ');
+  const f = parseFloat(vs);
+  const p = parseInt(ps);
+  const icon = st==='CHARGING'?' ⚡ 충전중' : st==='DISCHARGING'?' ▼ 방전' : st==='IDLE'?' ■ 유지' : '';
+  const el = document.getElementById('battery');
+  el.textContent = 'BAT: ' + (f>0 ? f.toFixed(2)+'V ('+p+'%)'+icon : '--');
+  el.style.color = st==='CHARGING' ? '#4db5ff' : f>=7.3?'#2ecc40' : f>=7.0?'#ffe066' : '#ff4136';
 })}
-setInterval(refresh,1000); refresh();
+function setp(k, v){
+  document.getElementById('v_'+k).textContent = (+v).toFixed(2);
+  fetch('/set?key='+k+'&val='+v);
+}
+function loadp(){
+  fetch('/params').then(r=>r.json()).then(p=>{
+    for(const k in p){
+      const inp = document.getElementById('p_'+k);
+      const sp = document.getElementById('v_'+k);
+      if(inp) inp.value = p[k];
+      if(sp) sp.textContent = (+p[k]).toFixed(2);
+    }
+  });
+}
+setInterval(refresh,1000); refresh(); loadp();
 </script>
 </body></html>'''.encode('utf-8'))
         elif self.path == '/stream':
@@ -335,6 +501,33 @@ setInterval(refresh,1000); refresh();
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'DRIVING' if driving_enabled else b'PAUSED')
+        elif self.path == '/battery':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f'{battery_v:.2f} {battery_pct} {battery_state}'.encode('utf-8'))
+        elif self.path == '/params':
+            import json
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(params).encode('utf-8'))
+        elif self.path.startswith('/set?'):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            key = qs.get('key', [None])[0]
+            val = qs.get('val', [None])[0]
+            ok = False
+            if key in params and val is not None:
+                try:
+                    params[key] = float(val)
+                    ok = True
+                except ValueError:
+                    pass
+            self.send_response(200 if ok else 400)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'ok' if ok else b'bad')
         else:
             self.send_error(404)
 

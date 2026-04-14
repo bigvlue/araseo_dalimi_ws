@@ -38,6 +38,11 @@ AWB_G = 0.89
 YELLOW_LOW = np.array([15, 80, 80])
 YELLOW_HIGH = np.array([35, 255, 255])
 
+# BEV (Bird-Eye-View) 변환 — lane_params.yaml 기본값
+BEV_SRC = np.float32([[  0, 480], [640, 480], [150, 300], [560, 300]])
+BEV_DST = np.float32([[100, 480], [540, 480], [100,   0], [540,   0]])
+BEV_M   = cv2.getPerspectiveTransform(BEV_SRC, BEV_DST)
+
 # ── 전역 ──
 latest_jpeg = None
 lock = threading.Lock()
@@ -224,9 +229,20 @@ def drive_loop():
             cv2.putText(disp, f'BR V avg/max: {br_v.mean():.0f}/{br_v.max():.0f}  (limit<={ROAD_V_MAX}, over={v_over:.0f}%)  road={br_road_pct:.0f}%',
                         (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
 
-            h2 = IMG_H // 2
-            w2 = IMG_W // 2
-            small = cv2.resize(disp, (w2*2, h2*2))
+            # ── BEV 변환 (시각화 전용, 조향에는 미사용) ──
+            bev = cv2.warpPerspective(disp, BEV_M, (IMG_W, IMG_H))
+            # BEV에 src 사다리꼴(원본에서 변환된 영역) 표시
+            for i in range(4):
+                p1 = tuple(BEV_SRC[i].astype(int))
+                p2 = tuple(BEV_SRC[(i+1) % 4].astype(int))
+                cv2.line(disp, p1, p2, (0, 255, 255), 1)
+            cv2.putText(disp, 'ORIGINAL', (10, IMG_H - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(bev, 'BEV', (10, IMG_H - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # 좌우 결합
+            combined = np.hstack([disp, bev])
+            small = cv2.resize(combined, (IMG_W, IMG_H // 2))
 
             _, jpeg = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 70])
             with lock:

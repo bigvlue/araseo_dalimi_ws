@@ -10,6 +10,7 @@ install(
 
 install(PROGRAMS
   scripts/dynamixel_driver_node.py
+  scripts/waypoint_follower.py
   scripts/start_robot.sh
   scripts/stop_robot.sh
   scripts/install_service.sh

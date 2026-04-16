@@ -12,6 +12,7 @@ import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from camera import Camera
 from battery import Battery
+from ultrasonic import Ultrasonic
 from dynamixel_sdk import PortHandler, PacketHandler
 
 # ── 설정 ──
@@ -58,10 +59,12 @@ latest_jpeg = None
 lock = threading.Lock()
 running = True
 driving_enabled = False    # 웹에서 START 누르기 전엔 정지 상태
+camera_enabled  = True     # 카메라 활성(배터리 절약용 토글)
 battery_v = 0.0            # 배터리 전압 (V), pinkylib I2C ADC 기반 (Pinky Pro = 2S LiPo)
 battery_pct = 0            # 배터리 잔량 (%)
 battery_state = '?'        # CHARGING / DISCHARGING / IDLE / ?
-battery_hist = deque(maxlen=16)   # (t, v) 샘플, 최대 16개 (약 32초)
+battery_hist = deque(maxlen=60)   # (t, v) 샘플, 최대 60개 (약 2분, 2s 간격)
+ultrasonic_dist_m = None          # 초음파 센서 거리 (m), None=읽기 실패
 
 # 런타임 튜닝 가능 파라미터 (웹에서 조정)
 params = {
@@ -78,12 +81,38 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
+def ultrasonic_loop():
+    """초음파 센서를 10Hz로 지속 측정하는 백그라운드 스레드"""
+    global ultrasonic_dist_m
+    try:
+        us = Ultrasonic()
+        print("[초음파] 초기화 완료 (I2C 0x08)")
+    except Exception as e:
+        print(f"[경고] 초음파 센서 초기화 실패: {e}")
+        return
+    while running:
+        try:
+            d = us.get_dist()
+            if d is not None and d >= 0:
+                ultrasonic_dist_m = d
+            else:
+                ultrasonic_dist_m = None
+        except Exception:
+            ultrasonic_dist_m = None
+        time.sleep(0.1)
+    us.close()
+
+
 def drive_loop():
     global latest_jpeg, running
 
-    cam = Camera()
-    cam.start(width=IMG_W, height=IMG_H)
-    time.sleep(1)
+    def open_camera():
+        c = Camera()
+        c.start(width=IMG_W, height=IMG_H)
+        time.sleep(1)
+        return c
+
+    cam = open_camera()
 
     port = PortHandler('/dev/ttyAMA4')
     port.openPort()
@@ -127,7 +156,7 @@ def drive_loop():
             # 이력 추가 후 선형 기울기(V/s)로 충전/방전 판정
             now = time.monotonic()
             battery_hist.append((now, battery_v))
-            if len(battery_hist) >= 6:
+            if len(battery_hist) >= 10 and (battery_hist[-1][0] - battery_hist[0][0]) >= 30:
                 xs = [t for t, _ in battery_hist]
                 ys = [vv for _, vv in battery_hist]
                 n = len(xs)
@@ -135,18 +164,66 @@ def drive_loop():
                 num = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
                 den = sum((xs[i] - mx) ** 2 for i in range(n)) or 1e-9
                 slope = num / den   # V/s
-                if   slope >  0.003: battery_state = 'CHARGING'
-                elif slope < -0.002: battery_state = 'DISCHARGING'
-                else:                battery_state = 'IDLE'
+                if   slope >  0.0005: battery_state = 'CHARGING'
+                elif slope < -0.0005: battery_state = 'DISCHARGING'
+                else:                 battery_state = 'IDLE'
         except Exception:
             pass
 
     read_battery()
     print(f"Autonomous driving started (battery: {battery_v:.2f}V, {battery_pct}%)")
     frame_count = 0
+    cam_active = True   # 실제 카메라 상태 (camera_enabled와 동기화)
+
+    def make_camera_off_jpeg():
+        """CAM OFF 상태 정적 이미지 (배터리 정보 포함)"""
+        img = np.zeros((IMG_H, IMG_W, 3), np.uint8)
+        img[:] = (30, 30, 30)
+        cv2.putText(img, 'CAMERA OFF', (IMG_W//2 - 170, 180),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.6, (100, 180, 255), 3)
+        cv2.putText(img, '(battery saving mode)', (IMG_W//2 - 170, 220),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+        if battery_v > 0:
+            if battery_state == 'CHARGING': col = (255, 200, 0)
+            elif battery_v >= 7.3: col = (0, 255, 0)
+            elif battery_v >= 7.0: col = (0, 255, 255)
+            else: col = (0, 0, 255)
+            tag = {'CHARGING': 'CHG', 'DISCHARGING': 'DIS',
+                   'IDLE': 'IDLE'}.get(battery_state, '?')
+            cv2.putText(img, f'BAT: {battery_v:.2f}V ({battery_pct}%) {tag}',
+                        (IMG_W//2 - 200, 320),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
+        _, jpg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return jpg.tobytes()
 
     try:
         while running:
+            # ── 카메라 On/Off 토글 처리 ──
+            if camera_enabled and not cam_active:
+                try:
+                    cam = open_camera()   # Picamera2 재생성 필요 (close된 객체 재사용 불가)
+                    cam_active = True
+                    print("[CAM] 켜짐")
+                except Exception as e:
+                    print(f"[CAM] 재시작 실패: {e}")
+                    time.sleep(1.0)
+                    continue
+            if not camera_enabled and cam_active:
+                stop_motor()
+                try:
+                    cam.close()
+                except Exception:
+                    pass
+                cam_active = False
+                print("[CAM] 꺼짐 (배터리 절약)")
+            # 카메라 꺼져있으면 배터리 읽기 + CAM OFF 이미지만
+            if not cam_active:
+                read_battery()
+                with lock:
+                    latest_jpeg = make_camera_off_jpeg()
+                time.sleep(1.0)
+                continue
+
             frame = cam.get_frame()
             r, g, b = cv2.split(frame)
             g = np.clip(g.astype(np.float32) * AWB_G, 0, 255).astype(np.uint8)
@@ -285,6 +362,17 @@ def drive_loop():
             cv2.rectangle(disp, (IMG_W - 305, 5), (IMG_W - 5, 35), (0, 0, 0), -1)
             cv2.putText(disp, bat_text, (IMG_W - 300, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, bat_color, 2)
+            # 초음파 거리 표시 (배터리 아래)
+            if ultrasonic_dist_m is not None:
+                dist_cm = ultrasonic_dist_m * 100.0
+                dist_color = (0, 0, 255) if dist_cm < 20 else (0, 255, 255) if dist_cm < 50 else (0, 255, 0)
+                dist_text = f'DIST: {dist_cm:.1f} cm'
+            else:
+                dist_color = (128, 128, 128)
+                dist_text = 'DIST: --'
+            cv2.rectangle(disp, (IMG_W - 220, 38), (IMG_W - 5, 62), (0, 0, 0), -1)
+            cv2.putText(disp, dist_text, (IMG_W - 215, 58),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, dist_color, 2)
             # 원본 기반 L/R/W (교차로 감지용)
             cv2.putText(disp,
                         f'L={road_left_x:.0f} R={road_right_x:.0f} W={road_width:.0f}',
@@ -383,7 +471,7 @@ def drive_loop():
 
 class MJPEGHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global running, driving_enabled
+        global running, driving_enabled, camera_enabled
         if self.path == '/':
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
@@ -396,6 +484,8 @@ button{padding:18px 36px;font-size:22px;color:#fff;border:none;border-radius:10p
 .start{background:#2ecc40}
 .pause{background:#ff851b}
 .stop{background:#ff4136}
+.cam{background:#0074d9}
+.camoff{background:#555}
 #state{font-size:24px;margin:8px;font-weight:bold}
 .params{background:#222;padding:12px 20px;border-radius:8px;margin:10px;min-width:560px}
 .param{display:flex;align-items:center;gap:10px;margin:8px 0}
@@ -406,9 +496,11 @@ button{padding:18px 36px;font-size:22px;color:#fff;border:none;border-radius:10p
 <img src="/stream">
 <div id="state">State: loading...</div>
 <div id="battery" style="font-size:22px;margin:4px;font-weight:bold">BAT: --</div>
+<div id="ultrasonic" style="font-size:22px;margin:4px;font-weight:bold">DIST: --</div>
 <div class="row">
   <button class="start" onclick="cmd('start')">START</button>
   <button class="pause" onclick="cmd('pause')">PAUSE</button>
+  <button id="btn_cam" class="cam" onclick="toggleCam()">CAM ON</button>
   <button class="stop" onclick="if(confirm('Stop program?'))cmd('stop')">EMERGENCY</button>
 </div>
 <div class="params">
@@ -433,9 +525,19 @@ button{padding:18px 36px;font-size:22px;color:#fff;border:none;border-radius:10p
 </div>
 <script>
 function cmd(c){fetch('/'+c).then(r=>r.text()).then(refresh)}
+function toggleCam(){
+  fetch('/cam_state').then(r=>r.text()).then(s=>{
+    fetch(s==='ON' ? '/cam_off' : '/cam_on').then(refresh);
+  });
+}
 function refresh(){fetch('/state').then(r=>r.text()).then(t=>{
   document.getElementById('state').textContent='State: '+t;
   document.getElementById('state').style.color = (t==='DRIVING')?'#2ecc40':'#ff851b';
+})
+fetch('/cam_state').then(r=>r.text()).then(s=>{
+  const b = document.getElementById('btn_cam');
+  b.textContent = 'CAM ' + s;
+  b.className = s==='ON' ? 'cam' : 'camoff';
 })
 fetch('/battery').then(r=>r.text()).then(v=>{
   const [vs, ps, st] = v.split(' ');
@@ -445,6 +547,13 @@ fetch('/battery').then(r=>r.text()).then(v=>{
   const el = document.getElementById('battery');
   el.textContent = 'BAT: ' + (f>0 ? f.toFixed(2)+'V ('+p+'%)'+icon : '--');
   el.style.color = st==='CHARGING' ? '#4db5ff' : f>=7.3?'#2ecc40' : f>=7.0?'#ffe066' : '#ff4136';
+})
+fetch('/ultrasonic').then(r=>r.text()).then(d=>{
+  const el = document.getElementById('ultrasonic');
+  if(d==='--'){el.textContent='DIST: --'; el.style.color='#888'; return;}
+  const cm = parseFloat(d);
+  el.textContent = 'DIST: ' + cm.toFixed(1) + ' cm';
+  el.style.color = cm<20?'#ff4136' : cm<50?'#ffe066' : '#2ecc40';
 })}
 function setp(k, v){
   document.getElementById('v_'+k).textContent = (+v).toFixed(2);
@@ -487,10 +596,15 @@ setInterval(refresh,1000); refresh(); loadp();
             self.end_headers()
             self.wfile.write(b'stopped')
         elif self.path == '/start':
-            driving_enabled = True
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'started')
+            if camera_enabled:
+                driving_enabled = True
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'started')
+            else:
+                self.send_response(409)
+                self.end_headers()
+                self.wfile.write(b'camera off')
         elif self.path == '/pause':
             driving_enabled = False
             self.send_response(200)
@@ -501,11 +615,31 @@ setInterval(refresh,1000); refresh(); loadp();
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'DRIVING' if driving_enabled else b'PAUSED')
+        elif self.path == '/cam_on':
+            camera_enabled = True
+            self.send_response(200); self.end_headers(); self.wfile.write(b'cam_on')
+        elif self.path == '/cam_off':
+            camera_enabled = False
+            driving_enabled = False   # 카메라 꺼지면 반드시 정지
+            self.send_response(200); self.end_headers(); self.wfile.write(b'cam_off')
+        elif self.path == '/cam_state':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'ON' if camera_enabled else b'OFF')
         elif self.path == '/battery':
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(f'{battery_v:.2f} {battery_pct} {battery_state}'.encode('utf-8'))
+        elif self.path == '/ultrasonic':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            if ultrasonic_dist_m is not None:
+                self.wfile.write(f'{ultrasonic_dist_m * 100.0:.1f}'.encode('utf-8'))
+            else:
+                self.wfile.write(b'--')
         elif self.path == '/params':
             import json
             self.send_response(200)
@@ -536,6 +670,7 @@ setInterval(refresh,1000); refresh(); loadp();
 
 
 if __name__ == '__main__':
+    threading.Thread(target=ultrasonic_loop, daemon=True).start()
     t = threading.Thread(target=drive_loop, daemon=True)
     t.start()
     print(f'Monitor: http://0.0.0.0:{STREAM_PORT}')

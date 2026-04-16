@@ -12,7 +12,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from nav_msgs.msg import Odometry
-from araseo_dalimi_interfaces.msg import PinkyGps, RobotPose
+from gps_field_msgs.msg import PinkyGps
+from araseo_dalimi_interfaces.msg import RobotPose
 
 
 class PinkyGpsBridgeNode(Node):
